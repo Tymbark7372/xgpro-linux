@@ -1,0 +1,22 @@
+LIBRARY WINUSB
+EXPORTS
+    WinUsb_AbortPipe                @1
+    WinUsb_ControlTransfer          @2
+    WinUsb_FlushPipe                @3
+    WinUsb_Free                     @4
+    WinUsb_GetAssociatedInterface   @5
+    WinUsb_GetCurrentAlternateSetting @6
+    WinUsb_GetDescriptor            @7
+    WinUsb_GetOverlappedResult      @8
+    WinUsb_GetPipePolicy            @9
+    WinUsb_GetPowerPolicy           @10
+    WinUsb_Initialize               @11
+    WinUsb_QueryDeviceInformation   @12
+    WinUsb_QueryInterfaceSettings   @13
+    WinUsb_QueryPipe                @14
+    WinUsb_ReadPipe                 @15
+    WinUsb_ResetPipe                @16
+    WinUsb_SetCurrentAlternateSetting @17
+    WinUsb_SetPipePolicy            @18
+    WinUsb_SetPowerPolicy           @19
+    WinUsb_WritePipe                @20
