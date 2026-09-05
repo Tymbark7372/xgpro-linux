@@ -241,7 +241,7 @@ static void handle_client(int client_fd) {
                 }
                 int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                              data_buf, req.length,
-                                             &transferred, 5000);
+                                             &transferred, 120000);
                 resp.status = (r == 0) ? 0 : r;
                 resp.length = transferred;
                 if (r != 0) {
@@ -295,7 +295,7 @@ static void handle_client(int client_fd) {
             int transferred = 0;
             int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                          data_buf, req.length,
-                                         &transferred, 5000);
+                                         &transferred, 120000);
             resp.status = (r == 0) ? 0 : r;
             if (r != 0) {
                 if (verbose)
