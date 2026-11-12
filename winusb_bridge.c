@@ -18,7 +18,7 @@
 #define BRIDGE_PORT 7372
 #define MAX_TRANSFER_LEN (16 * 1024 * 1024)
 #define BRIDGE_TOKEN_LEN 32
-#define BRIDGE_TOKEN_PATH_WINE "Z:\\tmp\\.xgpro-bridge-token"
+#define BRIDGE_TOKEN_PATH_WINE "\\\\?\\unix\\tmp\\.xgpro-bridge-token"
 
 enum bridge_cmd {
     CMD_OPEN = 1,
