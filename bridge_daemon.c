@@ -560,9 +560,15 @@ static void handle_client(int client_fd) {
                 break;
             }
             int transferred = 0;
+            if (verbose)
+                fprintf(stderr, "[bridge] READ ep=0x%02x requested %u bytes (timeout %d ms)\n",
+                        req.pipe_id, req.length, transfer_timeout(req.timeout_ms));
             int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                          data_buf, req.length,
                                          &transferred, transfer_timeout(req.timeout_ms));
+            if (r == 0 && transferred != (int)req.length && verbose)
+                fprintf(stderr, "[bridge] READ ep=0x%02x short: got %d of %u\n",
+                        req.pipe_id, transferred, req.length);
             resp.status = (r == 0) ? 0 : r;
             if (r != 0) {
                 if (verbose)
