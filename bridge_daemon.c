@@ -88,6 +88,162 @@ static void *usb_event_thread(void *arg)
     return NULL;
 }
 
+
+static int transfer_timeout(uint32_t requested);
+
+/* ------------------------------------------------------------------------
+ * TL866II+/T48/T56 dual-endpoint payload
+ *
+ * This family splits a payload block across two IN endpoints (0x82/0x83) and
+ * two OUT endpoints (0x02/0x03), alternating 64-byte chunks, and expects both
+ * halves to be transferred *at the same time*: minipro's read_payload2()
+ * submits length/2 on each endpoint and then deinterlaces.
+ *
+ * Draining one endpoint at a time does not just fail, it wedges the device:
+ * the firmware blocks inside its read handler waiting to push the other half,
+ * so the command channel stops answering and only a power cycle recovers it.
+ *
+ * So pair the requests here: transfer both halves concurrently, return the one
+ * the app asked for, and cache the sibling for its next request.
+ * ---------------------------------------------------------------------- */
+
+#define PAIR_MIN_LEN 65          /* >64 bytes: the dual-endpoint path */
+
+static struct {
+    int      valid;
+    uint8_t  ep;
+    uint32_t len;
+    uint8_t *data;
+} sibling_cache;
+
+static void sibling_cache_clear(void)
+{
+    free(sibling_cache.data);
+    sibling_cache.valid = 0;
+    sibling_cache.ep = 0;
+    sibling_cache.len = 0;
+    sibling_cache.data = NULL;
+}
+
+static uint8_t payload_sibling(uint8_t ep)
+{
+    switch (ep) {
+    case 0x82: return 0x83;
+    case 0x83: return 0x82;
+    default:   return 0;
+    }
+}
+
+typedef struct {
+    uint8_t  ep;
+    uint8_t *buf;
+    uint32_t len;
+    int      timeout;
+    int      transferred;
+    int      result;
+} io_job_t;
+
+static void *io_job_run(void *arg)
+{
+    io_job_t *j = arg;
+    j->transferred = 0;
+    j->result = libusb_bulk_transfer(dev_handle, j->ep, j->buf, j->len,
+                                     &j->transferred, j->timeout);
+    return NULL;
+}
+
+/* Run two transfers concurrently and wait for both. */
+static void io_pair(io_job_t *a, io_job_t *b)
+{
+    pthread_t ta, tb;
+
+    if (pthread_create(&ta, NULL, io_job_run, a) != 0) {
+        io_job_run(a);
+    }
+    if (pthread_create(&tb, NULL, io_job_run, b) != 0) {
+        io_job_run(b);
+    }
+    pthread_join(ta, NULL);
+    pthread_join(tb, NULL);
+}
+
+/* Returns 0 when the request was handled (response already sent), -1 to fall
+ * back to the generic path. */
+static int handle_paired_read(int client_fd, bridge_request_t *req,
+                              bridge_response_t *resp)
+{
+    uint8_t  other = payload_sibling(req->pipe_id);
+    uint8_t *req_buf = NULL, *other_buf = NULL;
+    io_job_t a, b;
+    int timeout;
+
+    if (model_pid != XGPRO_PID_T48 || other == 0 || req->length < PAIR_MIN_LEN)
+        return -1;
+
+    /* Serve the sibling half we already fetched. */
+    if (sibling_cache.valid && sibling_cache.ep == req->pipe_id &&
+        sibling_cache.len == req->length) {
+        if (verbose)
+            fprintf(stderr, "[bridge] paired read: serving cached 0x%02x (%u bytes)\n",
+                    req->pipe_id, req->length);
+        resp->status = 0;
+        resp->length = req->length;
+        if (send_all(client_fd, resp, sizeof(*resp)) < 0) return 0;
+        send_all(client_fd, sibling_cache.data, sibling_cache.len);
+        sibling_cache_clear();
+        return 0;
+    }
+
+    sibling_cache_clear();
+
+    timeout = transfer_timeout(req->timeout_ms);
+    req_buf = malloc(req->length);
+    other_buf = malloc(req->length);
+    if (!req_buf || !other_buf) {
+        free(req_buf);
+        free(other_buf);
+        return -1;
+    }
+
+    memset(&a, 0, sizeof(a));
+    a.ep = req->pipe_id;  a.buf = req_buf;   a.len = req->length; a.timeout = timeout;
+    memset(&b, 0, sizeof(b));
+    b.ep = other;         b.buf = other_buf; b.len = req->length; b.timeout = timeout;
+
+    if (verbose)
+        fprintf(stderr, "[bridge] paired read: 0x%02x and 0x%02x, %u bytes each\n",
+                a.ep, b.ep, req->length);
+    io_pair(&a, &b);
+
+    if (verbose)
+        fprintf(stderr, "[bridge] paired read: 0x%02x -> %s (%d), 0x%02x -> %s (%d)\n",
+                a.ep, libusb_error_name(a.result), a.transferred,
+                b.ep, libusb_error_name(b.result), b.transferred);
+
+    /* Keep the sibling's half for the app's next request. */
+    if (a.result == 0 && b.result == 0 && b.transferred == (int)req->length) {
+        sibling_cache.valid = 1;
+        sibling_cache.ep = other;
+        sibling_cache.len = req->length;
+        sibling_cache.data = other_buf;
+        other_buf = NULL;
+    }
+    free(other_buf);
+
+    resp->status = a.result;
+    resp->length = (a.result == 0) ? (uint32_t)a.transferred : 0;
+    if (send_all(client_fd, resp, sizeof(*resp)) < 0) {
+        free(req_buf);
+        return 0;
+    }
+    if (resp->length > 0)
+        send_all(client_fd, req_buf, resp->length);
+    free(req_buf);
+
+    if (a.result == 0) commands_since_open++;
+    return 0;
+}
+
 static void *client_thread(void *arg)
 {
     int fd = (int)(intptr_t)arg;
@@ -560,6 +716,9 @@ static void handle_client(int client_fd) {
                 if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
                 break;
             }
+
+            if (handle_paired_read(client_fd, &req, &resp) == 0)
+                break;
 
             /* The T76 firmware never services endpoint 0x83, yet Xgpro reads
              * 32 bytes from it after the status query. Waiting for a reply
