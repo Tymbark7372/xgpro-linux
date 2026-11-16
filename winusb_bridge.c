@@ -639,9 +639,22 @@ __declspec(dllexport) BOOL __stdcall WinUsb_Free(void *InterfaceHandle) {
     return TRUE;
 }
 
-__declspec(dllexport) BOOL __stdcall WinUsb_WritePipe(
-    void *InterfaceHandle, UCHAR PipeID,
-    PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred, void *Overlapped)
+/* Xgpro drives payload transfers as OVERLAPPED I/O: it creates an event,
+ * passes it to WinUsb_ReadPipe/WritePipe and then waits on it. Our transfers
+ * are synchronous, so the work is already done when the call returns - but
+ * the event still has to be set, otherwise the app waits until its own
+ * timeout and reports "read timeout at address 0" even though the data
+ * arrived. */
+static void complete_overlapped(void *Overlapped, BOOL ok, DWORD transferred)
+{
+    LPOVERLAPPED ov = (LPOVERLAPPED)Overlapped;
+    if (!ov) return;
+    ov->Internal = ok ? 0 : (ULONG_PTR)GetLastError();
+    ov->InternalHigh = ok ? transferred : 0;
+    if (ov->hEvent) SetEvent(ov->hEvent);
+}
+
+static BOOL write_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred)
 {
     if (is_verbose()) {
         char hex[128] = {0};
@@ -683,9 +696,7 @@ __declspec(dllexport) BOOL __stdcall WinUsb_WritePipe(
     return TRUE;
 }
 
-__declspec(dllexport) BOOL __stdcall WinUsb_ReadPipe(
-    void *InterfaceHandle, UCHAR PipeID,
-    PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred, void *Overlapped)
+static BOOL read_pipe(UCHAR PipeID, PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred)
 {
     if (is_verbose())
         dbg("WinUsb_ReadPipe pipe=0x%02x len=%u", PipeID, BufferLength);
@@ -751,6 +762,24 @@ __declspec(dllexport) BOOL __stdcall WinUsb_ReadPipe(
     if (LengthTransferred) *LengthTransferred = resp.length;
     if (resp.status != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
     return TRUE;
+}
+
+__declspec(dllexport) BOOL __stdcall WinUsb_WritePipe(
+    void *InterfaceHandle, UCHAR PipeID,
+    PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred, void *Overlapped)
+{
+    BOOL ok = write_pipe(PipeID, Buffer, BufferLength, LengthTransferred);
+    complete_overlapped(Overlapped, ok, (ok && LengthTransferred) ? *LengthTransferred : 0);
+    return ok;
+}
+
+__declspec(dllexport) BOOL __stdcall WinUsb_ReadPipe(
+    void *InterfaceHandle, UCHAR PipeID,
+    PUCHAR Buffer, ULONG BufferLength, PULONG LengthTransferred, void *Overlapped)
+{
+    BOOL ok = read_pipe(PipeID, Buffer, BufferLength, LengthTransferred);
+    complete_overlapped(Overlapped, ok, (ok && LengthTransferred) ? *LengthTransferred : 0);
+    return ok;
 }
 
 __declspec(dllexport) BOOL __stdcall WinUsb_SetPipePolicy(
