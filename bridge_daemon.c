@@ -294,22 +294,34 @@ static int handle_paired_read(int client_fd, bridge_request_t *req,
     io_job_t a, b;
     int timeout;
 
-    if (!dev_handle || other == 0 || req->length < PAIR_MIN_LEN)
+    if (!dev_handle || other == 0)
         return -1;
 
-    /* Serve the sibling half we already fetched. */
-    if (sibling_cache.valid && sibling_cache.ep == req->pipe_id &&
-        sibling_cache.len == req->length) {
-        if (verbose)
+    /* Serve the sibling half we already fetched. The sizes need not match: a
+     * short read is legal USB behaviour and is what the app would see from the
+     * device, so hand back as much as we hold and let it decide. */
+    if (sibling_cache.valid && sibling_cache.ep == req->pipe_id) {
+        uint32_t n = sibling_cache.len < req->length ? sibling_cache.len : req->length;
+
+        if (n != sibling_cache.len)
+            fprintf(stderr, "[bridge] paired read: cached 0x%02x holds %u, request is %u "
+                            "(serving %u, discarding %u)\n",
+                    req->pipe_id, sibling_cache.len, req->length, n,
+                    sibling_cache.len - n);
+        else if (verbose)
             fprintf(stderr, "[bridge] paired read: serving cached 0x%02x (%u bytes)\n",
-                    req->pipe_id, req->length);
+                    req->pipe_id, n);
+
         resp->status = 0;
-        resp->length = req->length;
+        resp->length = n;
         if (send_all(client_fd, resp, sizeof(*resp)) < 0) return 0;
-        send_all(client_fd, sibling_cache.data, sibling_cache.len);
+        if (n > 0) send_all(client_fd, sibling_cache.data, n);
         sibling_cache_clear();
         return 0;
     }
+
+    if (req->length < PAIR_MIN_LEN)
+        return -1;
 
     sibling_cache_clear();
 
@@ -337,13 +349,18 @@ static int handle_paired_read(int client_fd, bridge_request_t *req,
                 a.ep, libusb_error_name(a.result), a.transferred,
                 b.ep, libusb_error_name(b.result), b.transferred);
 
-    /* Keep the sibling's half for the app's next request. */
-    if (a.result == 0 && b.result == 0 && b.transferred == (int)req->length) {
+    /* Keep whatever the sibling delivered, keyed by its real length. Those
+     * bytes are the app's next request, so dropping them on a size mismatch
+     * would lose data (and re-stall). Only an empty result is dropped. */
+    if (b.transferred > 0) {
         sibling_cache.valid = 1;
         sibling_cache.ep = other;
-        sibling_cache.len = req->length;
+        sibling_cache.len = (uint32_t)b.transferred;
         sibling_cache.data = other_buf;
         other_buf = NULL;
+        if (b.transferred != (int)req->length)
+            fprintf(stderr, "[bridge] paired read: sibling 0x%02x returned %d of %u, cached as-is\n",
+                    other, b.transferred, req->length);
     }
     free(other_buf);
 
