@@ -38,6 +38,10 @@ static const char *model_name = NULL;
 static int srv_fd = -1;
 static int active_client = -1;
 
+
+static void handle_client(int client_fd);
+static void close_device(void);
+
 static void sig_handler(int sig) {
     (void)sig;
     running = 0;
@@ -220,6 +224,15 @@ static void reset_endpoint(uint8_t ep) {
     libusb_clear_halt(dev_handle, ep);
 }
 
+/* A firmware update pulls the device off the bus between transfers. Treat
+ * that as a released handle so the next CMD_OPEN re-opens it, instead of
+ * hammering a handle that libusb has already invalidated. */
+static void handle_device_loss(int r) {
+    if (r != LIBUSB_ERROR_NO_DEVICE) return;
+    fprintf(stderr, "[bridge] Device left the bus (re-enumeration), releasing handle\n");
+    close_device();
+}
+
 static void close_device(void) {
     if (dev_handle) {
         libusb_release_interface(dev_handle, 0);
@@ -362,6 +375,7 @@ static void handle_client(int client_fd) {
                     if (verbose)
                         fprintf(stderr, "[bridge] WRITE error: %s, transferred=%d\n", libusb_error_name(r), transferred);
                     reset_endpoint(req.pipe_id);
+                    handle_device_loss(r);
                 }
             }
             if (send_all(client_fd, &resp, sizeof(resp)) < 0) {
@@ -415,6 +429,7 @@ static void handle_client(int client_fd) {
                 if (verbose)
                     fprintf(stderr, "[bridge] READ error: %s, transferred=%d\n", libusb_error_name(r), transferred);
                 reset_endpoint(req.pipe_id);
+                handle_device_loss(r);
                 resp.length = 0;
             } else {
                 resp.length = transferred;
