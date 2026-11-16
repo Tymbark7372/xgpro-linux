@@ -48,6 +48,10 @@ static uint8_t auth_token[BRIDGE_TOKEN_LEN];
 static int commands_since_open = 0;   /* >0 once the handle has done real work */
 static int event_fd = -1;                 /* subscribed client for hotplug events */
 static pthread_mutex_t event_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t dev_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  dev_cv = PTHREAD_COND_INITIALIZER;
+static int transfers_in_flight = 0;
+static int device_users = 0;
 static int send_all(int fd, const void *buf, size_t len);
 static uint8_t bulk_eps[MAX_BULK_EPS];
 static int bulk_ep_count = 0;
@@ -65,6 +69,40 @@ static int clients_running = 0;
 static void handle_client(int client_fd);
 static void close_device(void);
 static int open_device(void);
+static int open_device_locked(void);
+
+static int open_device(void) {
+    int r;
+    pthread_mutex_lock(&dev_mu);
+    r = open_device_locked();
+    pthread_mutex_unlock(&dev_mu);
+    return r;
+}
+
+static int device_acquire(void) {
+    if (open_device() != 0) return -1;
+    pthread_mutex_lock(&dev_mu);
+    device_users++;
+    pthread_mutex_unlock(&dev_mu);
+    return 0;
+}
+
+/* Only the connection that acquired the device releases it, and only the last
+ * user actually closes: the app has two connections (commands and the hotplug
+ * subscription) and both used to call close_device() on exit, which freed the
+ * handle twice. */
+static void device_release(void) {
+    int last = 0;
+
+    pthread_mutex_lock(&dev_mu);
+    if (device_users > 0) {
+        device_users--;
+        last = (device_users == 0);
+    }
+    pthread_mutex_unlock(&dev_mu);
+
+    if (last) close_device();
+}
 
 /* Real hotplug, no fabrication: the app is told about attach/detach exactly
  * when the programmer does it. This is what the firmware-update flow needs,
@@ -150,6 +188,33 @@ static uint8_t payload_sibling(uint8_t ep)
     return 0;
 }
 
+/* A transfer must not race a close: take a reference for its duration and let
+ * close_device() wait for the reference to drop. */
+static int do_transfer(uint8_t ep, uint8_t *buf, uint32_t len,
+                       int *transferred, int timeout)
+{
+    libusb_device_handle *h;
+    int r;
+
+    pthread_mutex_lock(&dev_mu);
+    if (!dev_handle) {
+        pthread_mutex_unlock(&dev_mu);
+        if (transferred) *transferred = 0;
+        return LIBUSB_ERROR_NO_DEVICE;
+    }
+    h = dev_handle;
+    transfers_in_flight++;
+    pthread_mutex_unlock(&dev_mu);
+
+    r = libusb_bulk_transfer(h, ep, buf, len, transferred, timeout);
+
+    pthread_mutex_lock(&dev_mu);
+    transfers_in_flight--;
+    if (transfers_in_flight == 0) pthread_cond_broadcast(&dev_cv);
+    pthread_mutex_unlock(&dev_mu);
+    return r;
+}
+
 typedef struct {
     uint8_t  ep;
     uint8_t *buf;
@@ -163,8 +228,7 @@ static void *io_job_run(void *arg)
 {
     io_job_t *j = arg;
     j->transferred = 0;
-    j->result = libusb_bulk_transfer(dev_handle, j->ep, j->buf, j->len,
-                                     &j->transferred, j->timeout);
+    j->result = do_transfer(j->ep, j->buf, j->len, &j->transferred, j->timeout);
     return NULL;
 }
 
@@ -212,9 +276,9 @@ static void pending_write_flush(void)
 
     if (dev_handle && pending_write.len) {
         int transferred = 0;
-        int r = libusb_bulk_transfer(dev_handle, pending_write.ep,
-                                     pending_write.data, pending_write.len,
-                                     &transferred, 5000);
+        int r = do_transfer(pending_write.ep,
+                            pending_write.data, pending_write.len,
+                            &transferred, 5000);
         fprintf(stderr, "[bridge] unpaired write flushed: ep=0x%02x len=%u %s (%d)\n",
                 pending_write.ep, pending_write.len, libusb_error_name(r), transferred);
     }
@@ -383,7 +447,6 @@ static void *client_thread(void *arg)
     int fd = (int)(intptr_t)arg;
     handle_client(fd);
     active_client = -1;
-    close_device();
     close(fd);
 
     pthread_mutex_lock(&clients_mu);
@@ -536,7 +599,7 @@ static int retry_first_command(uint8_t ep, uint8_t *buf, uint32_t len, int *tran
         return LIBUSB_ERROR_NO_DEVICE;
 
     *transferred = 0;
-    r = libusb_bulk_transfer(dev_handle, ep, buf, len, transferred, 5000);
+    r = do_transfer(ep, buf, len, transferred, 5000);
     if (r == 0)
         fprintf(stderr, "[bridge] first command retried successfully after re-enumeration\n");
     return r;
@@ -555,7 +618,7 @@ static void drain_payload_ep(uint8_t ep)
 
     for (int i = 0; i < 256; i++) {
         int n = 0;
-        int r = libusb_bulk_transfer(dev_handle, ep, buf, sizeof(buf), &n, 20);
+        int r = do_transfer(ep, buf, sizeof(buf), &n, 20);
         if (r != 0 || n <= 0) break;
         total += n;
     }
@@ -563,7 +626,7 @@ static void drain_payload_ep(uint8_t ep)
         fprintf(stderr, "[bridge] drained %d stale bytes from ep 0x%02x\n", total, ep);
 }
 
-static int open_device(void) {
+static int open_device_locked(void) {
     if (dev_handle) return 0;
 
     int waited = 0;
@@ -669,7 +732,17 @@ static void handle_device_loss(int r) {
 }
 
 static void close_device(void) {
+    struct timespec ts;
+
+    pthread_mutex_lock(&dev_mu);
     if (dev_handle) {
+        /* Let in-flight transfers drain, but never block shutdown forever on
+         * a wedged device. */
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 3;
+        while (transfers_in_flight > 0)
+            if (pthread_cond_timedwait(&dev_cv, &dev_mu, &ts) != 0) break;
+
         libusb_release_interface(dev_handle, 0);
         if (kernel_driver_detached) {
             libusb_attach_kernel_driver(dev_handle, 0);
@@ -679,6 +752,7 @@ static void close_device(void) {
         dev_handle = NULL;
         fprintf(stderr, "[bridge] Programmer closed\n");
     }
+    pthread_mutex_unlock(&dev_mu);
 }
 
 static int send_all(int fd, const void *buf, size_t len) {
@@ -718,6 +792,7 @@ static int authenticate_client(int client_fd) {
 }
 
 static void handle_client(int client_fd) {
+    int owns_device = 0;
     fprintf(stderr, "[bridge] XGPro connected\n");
 
     if (authenticate_client(client_fd) < 0) {
@@ -752,12 +827,17 @@ static void handle_client(int client_fd) {
 
         switch (req.cmd) {
         case CMD_OPEN:
-            resp.status = open_device();
+            if (!owns_device) {
+                if (device_acquire() == 0) { owns_device = 1; resp.status = 0; }
+                else resp.status = -1;
+            } else {
+                resp.status = dev_handle ? 0 : -1;
+            }
             if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
             break;
 
         case CMD_CLOSE:
-            close_device();
+            if (owns_device) { device_release(); owns_device = 0; }
             resp.status = 0;
             if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
             break;
@@ -824,9 +904,9 @@ static void handle_client(int client_fd) {
                     model && model->payload_in && model->payload_in_peer == 0)
                     drain_payload_ep(model->payload_in);
 
-                int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
-                                             data_buf, req.length,
-                                             &transferred, transfer_timeout(req.timeout_ms));
+                int r = do_transfer(req.pipe_id,
+                                    data_buf, req.length,
+                                    &transferred, transfer_timeout(req.timeout_ms));
                 if (r == LIBUSB_ERROR_NO_DEVICE && transferred == 0 &&
                     commands_since_open == 0) {
                     fprintf(stderr, "[bridge] first command hit a vanished device, retrying\n");
@@ -916,9 +996,9 @@ static void handle_client(int client_fd) {
             if (verbose)
                 fprintf(stderr, "[bridge] READ ep=0x%02x requested %u bytes (timeout %d ms)\n",
                         req.pipe_id, req.length, transfer_timeout(req.timeout_ms));
-            int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
-                                         data_buf, req.length,
-                                         &transferred, transfer_timeout(req.timeout_ms));
+            int r = do_transfer(req.pipe_id,
+                                data_buf, req.length,
+                                &transferred, transfer_timeout(req.timeout_ms));
             if (r == 0 && transferred != (int)req.length && verbose)
                 fprintf(stderr, "[bridge] READ ep=0x%02x short: got %d of %u\n",
                         req.pipe_id, transferred, req.length);
@@ -972,6 +1052,7 @@ static void handle_client(int client_fd) {
     }
 
 disconnect:
+    if (owns_device) device_release();
     fprintf(stderr, "[bridge] XGPro disconnected\n");
     close(client_fd);
 }
