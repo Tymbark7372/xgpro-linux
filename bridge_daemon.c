@@ -32,6 +32,7 @@ static libusb_context *ctx = NULL;
 static volatile int running = 1;
 static int kernel_driver_detached = 0;
 static uint8_t auth_token[BRIDGE_TOKEN_LEN];
+static int commands_since_open = 0;   /* >0 once the handle has done real work */
 static uint8_t bulk_eps[MAX_BULK_EPS];
 static int bulk_ep_count = 0;
 static const char *model_name = NULL;
@@ -41,6 +42,7 @@ static int active_client = -1;
 
 static void handle_client(int client_fd);
 static void close_device(void);
+static int open_device(void);
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -148,6 +150,25 @@ static int transfer_timeout(uint32_t requested) {
     return (int)requested;
 }
 
+/* During a firmware update the app re-opens the device while the previous
+ * instance is still on the bus; the first command then fails with NO_DEVICE.
+ * Nothing was transferred, so it is safe to wait for the device to settle and
+ * resend. Only done while the handle has not completed any command yet. */
+static int retry_first_command(uint8_t ep, uint8_t *buf, uint32_t len, int *transferred)
+{
+    int r;
+
+    close_device();
+    if (open_device() != 0)
+        return LIBUSB_ERROR_NO_DEVICE;
+
+    *transferred = 0;
+    r = libusb_bulk_transfer(dev_handle, ep, buf, len, transferred, 5000);
+    if (r == 0)
+        fprintf(stderr, "[bridge] first command retried successfully after re-enumeration\n");
+    return r;
+}
+
 static int open_device(void) {
     if (dev_handle) return 0;
 
@@ -215,6 +236,7 @@ static int open_device(void) {
      * LIBUSB_ERROR_IO and needs a power cycle. minipro never sends them
      * either. Endpoints are only cleared after a transfer actually fails. */
 
+    commands_since_open = 0;
     fprintf(stderr, "[bridge] %s opened, configured, and interface claimed\n", model_name);
     return 0;
 }
@@ -361,6 +383,11 @@ static void handle_client(int client_fd) {
                 int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                              data_buf, req.length,
                                              &transferred, transfer_timeout(req.timeout_ms));
+                if (r == LIBUSB_ERROR_NO_DEVICE && transferred == 0 &&
+                    commands_since_open == 0) {
+                    fprintf(stderr, "[bridge] first command hit a vanished device, retrying\n");
+                    r = retry_first_command(req.pipe_id, data_buf, req.length, &transferred);
+                }
                 if (r == 0 && transferred != (int)req.length) {
                     /* Never report a short write as success: a truncated
                      * chunk inside a firmware image or chip payload would
@@ -371,6 +398,7 @@ static void handle_client(int client_fd) {
                 }
                 resp.status = (r == 0) ? 0 : r;
                 resp.length = transferred;
+                if (r == 0) commands_since_open++;
                 if (r != 0) {
                     if (verbose)
                         fprintf(stderr, "[bridge] WRITE error: %s, transferred=%d\n", libusb_error_name(r), transferred);
