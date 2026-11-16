@@ -331,6 +331,14 @@ static void handle_client(int client_fd) {
                 int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                              data_buf, req.length,
                                              &transferred, 120000);
+                if (r == 0 && transferred != (int)req.length) {
+                    /* Never report a short write as success: a truncated
+                     * chunk inside a firmware image or chip payload would
+                     * corrupt the device silently. */
+                    fprintf(stderr, "[bridge] WRITE ep=0x%02x short transfer %d/%u\n",
+                            req.pipe_id, transferred, req.length);
+                    r = LIBUSB_ERROR_IO;
+                }
                 resp.status = (r == 0) ? 0 : r;
                 resp.length = transferred;
                 if (r != 0) {
