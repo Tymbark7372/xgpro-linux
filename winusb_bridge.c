@@ -55,15 +55,58 @@ typedef struct {
     char  DevicePath[260];
 } MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A;
 
-static const GUID XGPRO_GUID = {
-    0xE7E8BA13, 0x2A81, 0x446E,
-    {0xA1, 0x1E, 0x72, 0x39, 0x8F, 0xBD, 0xA8, 0x2F}
+/* DeviceInterfaceGUIDs come from the vendor INF shipped with each Xgpro
+ * release, and the app compares whatever it passes to SetupDiGetClassDevsA.
+ * T48/T56/TL866II Plus and the T76 use different GUIDs. */
+#define XGPRO_PID_T48 0x0A53
+#define XGPRO_PID_T76 0x1A86
+
+typedef struct {
+    GUID        guid;
+    uint16_t    pid;
+    const char *name;
+} xgpro_profile_t;
+
+static const xgpro_profile_t XGPRO_PROFILES[] = {
+    { { 0xE7E8BA13, 0x2A81, 0x446E, { 0xA1, 0x1E, 0x72, 0x39, 0x8F, 0xBD, 0xA8, 0x2F } },
+      XGPRO_PID_T48, "T48" },
+    { { 0x015DE341, 0x91CC, 0x8286, { 0x39, 0x64, 0x1A, 0x00, 0x6B, 0xC1, 0xF0, 0x0F } },
+      XGPRO_PID_T76, "T76" },
 };
+#define XGPRO_PROFILE_COUNT ((int)(sizeof(XGPRO_PROFILES) / sizeof(XGPRO_PROFILES[0])))
+
+static int selected_profile = -1;
+static char fake_dev_path[260];
 
 #define FAKE_HDEVINFO       ((HANDLE)(ULONG_PTR)0xDE000001)
 #define FAKE_FILE_HANDLE    ((HANDLE)(ULONG_PTR)0xCA000001)
 #define FAKE_WINUSB_HANDLE  ((void *)(ULONG_PTR)0xBE000001)
-#define FAKE_DEV_PATH       "\\\\?\\USB#VID_A466&PID_0A53#T48#{e7e8ba13-2a81-446e-a11e-72398fbda82f}"
+
+static int profile_index_for_guid(const GUID *guid) {
+    for (int i = 0; i < XGPRO_PROFILE_COUNT; i++) {
+        if (memcmp(guid, &XGPRO_PROFILES[i].guid, sizeof(GUID)) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static const xgpro_profile_t *current_profile(void) {
+    if (selected_profile < 0) selected_profile = 0;
+    return &XGPRO_PROFILES[selected_profile];
+}
+
+static const char *device_path(void) {
+    const xgpro_profile_t *p = current_profile();
+    const GUID *g = &p->guid;
+
+    snprintf(fake_dev_path, sizeof(fake_dev_path),
+             "\\\\?\\USB#VID_A466&PID_%04X#%s#{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+             p->pid, p->name,
+             (unsigned long)g->Data1, g->Data2, g->Data3,
+             g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3],
+             g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
+    return fake_dev_path;
+}
 
 static SOCKET bridge_sock = INVALID_SOCKET;
 static int wsa_inited = 0;
@@ -197,9 +240,14 @@ static int bridge_recv(void *buf, int len) {
 static HANDLE WINAPI my_SetupDiGetClassDevsA(
     const GUID *ClassGuid, const char *Enumerator, HWND hwndParent, DWORD Flags)
 {
-    if (ClassGuid && memcmp(ClassGuid, &XGPRO_GUID, sizeof(GUID)) == 0) {
-        dbg("SetupDiGetClassDevsA: matched XGPro GUID -> returning fake HDEVINFO");
-        return FAKE_HDEVINFO;
+    if (ClassGuid) {
+        int idx = profile_index_for_guid(ClassGuid);
+        if (idx >= 0) {
+            selected_profile = idx;
+            dbg("SetupDiGetClassDevsA: matched %s GUID -> returning fake HDEVINFO",
+                XGPRO_PROFILES[idx].name);
+            return FAKE_HDEVINFO;
+        }
     }
     dbg("SetupDiGetClassDevsA: unknown GUID, returning INVALID_HANDLE_VALUE");
     SetLastError(ERROR_NO_MORE_ITEMS);
@@ -212,10 +260,10 @@ static BOOL WINAPI my_SetupDiEnumDeviceInterfaces(
     MY_SP_DEVICE_INTERFACE_DATA *DeviceInterfaceData)
 {
     if (DeviceInfoSet == FAKE_HDEVINFO && MemberIndex == 0) {
-        dbg("SetupDiEnumDeviceInterfaces: returning T48 at index 0");
+        dbg("SetupDiEnumDeviceInterfaces: returning %s at index 0", current_profile()->name);
         if (DeviceInterfaceData) {
             DeviceInterfaceData->cbSize = sizeof(MY_SP_DEVICE_INTERFACE_DATA);
-            memcpy(&DeviceInterfaceData->InterfaceClassGuid, &XGPRO_GUID, sizeof(GUID));
+            memcpy(&DeviceInterfaceData->InterfaceClassGuid, &current_profile()->guid, sizeof(GUID));
             DeviceInterfaceData->Flags = 1;
             DeviceInterfaceData->Reserved = 0;
         }
@@ -230,7 +278,7 @@ static BOOL WINAPI my_SetupDiGetDeviceInterfaceDetailA(
     MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A *DetailData, DWORD DetailDataSize,
     DWORD *RequiredSize, void *DeviceInfoData)
 {
-    DWORD needed = offsetof(MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A, DevicePath) + strlen(FAKE_DEV_PATH) + 1;
+    DWORD needed = offsetof(MY_SP_DEVICE_INTERFACE_DETAIL_DATA_A, DevicePath) + strlen(device_path()) + 1;
     dbg("SetupDiGetDeviceInterfaceDetailA: needed=%u provided=%u", needed, DetailDataSize);
 
     if (RequiredSize) *RequiredSize = needed;
@@ -241,7 +289,7 @@ static BOOL WINAPI my_SetupDiGetDeviceInterfaceDetailA(
     }
 
     DetailData->cbSize = 5;
-    strncpy(DetailData->DevicePath, FAKE_DEV_PATH, sizeof(DetailData->DevicePath) - 1);
+    strncpy(DetailData->DevicePath, device_path(), sizeof(DetailData->DevicePath) - 1);
     DetailData->DevicePath[sizeof(DetailData->DevicePath) - 1] = '\0';
     dbg("  -> path: %s", DetailData->DevicePath);
     return TRUE;
@@ -266,7 +314,7 @@ static HANDLE WINAPI my_CreateFileA(
         upper[sizeof(upper) - 1] = '\0';
         _strupr(upper);
         if (strstr(upper, "VID_A466")) {
-            dbg("CreateFileA: intercepted T48 device open -> fake handle");
+            dbg("CreateFileA: intercepted XGecu device open -> fake handle");
             return FAKE_FILE_HANDLE;
         }
     }

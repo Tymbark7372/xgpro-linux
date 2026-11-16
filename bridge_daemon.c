@@ -16,11 +16,22 @@ static int verbose = 0;
 
 #define MAX_TRANSFER_LEN (16 * 1024 * 1024)
 
+/* Programmers are told apart by PID only; the VID is shared. */
+static const struct xgpro_model {
+    uint16_t pid;
+    const char *name;
+} XGPRO_MODELS[] = {
+    { XGPRO_PID_T48, "T48/T56/TL866II Plus" },
+    { XGPRO_PID_T76, "T76" },
+};
+#define XGPRO_MODEL_COUNT ((int)(sizeof(XGPRO_MODELS) / sizeof(XGPRO_MODELS[0])))
+
 static libusb_device_handle *dev_handle = NULL;
 static libusb_context *ctx = NULL;
 static volatile int running = 1;
 static int kernel_driver_detached = 0;
 static uint8_t auth_token[BRIDGE_TOKEN_LEN];
+static const char *model_name = NULL;
 
 static void sig_handler(int sig) {
     (void)sig;
@@ -66,11 +77,18 @@ static int generate_token(void) {
 static int open_device(void) {
     if (dev_handle) return 0;
 
-    dev_handle = libusb_open_device_with_vid_pid(ctx, T48_VID, T48_PID);
+    for (int i = 0; i < XGPRO_MODEL_COUNT && !dev_handle; i++) {
+        dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, XGPRO_MODELS[i].pid);
+        if (dev_handle) model_name = XGPRO_MODELS[i].name;
+    }
     if (!dev_handle) {
-        fprintf(stderr, "[bridge] T48 not found (VID=%04x PID=%04x)\n", T48_VID, T48_PID);
+        fprintf(stderr, "[bridge] No XGecu programmer found (VID=%04x PIDs:", XGPRO_VID);
+        for (int i = 0; i < XGPRO_MODEL_COUNT; i++)
+            fprintf(stderr, " %04x", XGPRO_MODELS[i].pid);
+        fprintf(stderr, ")\n");
         return -1;
     }
+    fprintf(stderr, "[bridge] Found %s\n", model_name);
 
     if (libusb_kernel_driver_active(dev_handle, 0) == 1) {
         int dr = libusb_detach_kernel_driver(dev_handle, 0);
@@ -105,7 +123,7 @@ static int open_device(void) {
     libusb_clear_halt(dev_handle, 0x02);
     libusb_clear_halt(dev_handle, 0x82);
 
-    fprintf(stderr, "[bridge] T48 opened, configured, and interface claimed\n");
+    fprintf(stderr, "[bridge] %s opened, configured, and interface claimed\n", model_name);
     return 0;
 }
 
@@ -123,7 +141,7 @@ static void close_device(void) {
         }
         libusb_close(dev_handle);
         dev_handle = NULL;
-        fprintf(stderr, "[bridge] T48 closed\n");
+        fprintf(stderr, "[bridge] Programmer closed\n");
     }
 }
 

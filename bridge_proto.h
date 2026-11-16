@@ -28,13 +28,13 @@ typedef struct {
 } bridge_response_t;
 #pragma pack(pop)
 
-#define T48_VID 0xA466
-#define T48_PID 0x0A53
+/* All XGecu programmers share the same vendor ID and differ only by PID. */
+#define XGPRO_VID      0xA466
+#define XGPRO_PID_T48  0x0A53   /* T48, T56, TL866II Plus */
+#define XGPRO_PID_T76  0x1A86   /* T76 */
 
-#define T48_EP1_OUT 0x01
-#define T48_EP1_IN  0x81
-#define T48_EP2_OUT 0x02
-#define T48_EP2_IN  0x82
+/* Bulk endpoint addresses are discovered from the device descriptor, because
+ * they are not guaranteed to be identical across programmer models. */
 
 #define BRIDGE_TOKEN_LEN 32
 #define BRIDGE_TOKEN_PATH "/tmp/.xgpro-bridge-token"
