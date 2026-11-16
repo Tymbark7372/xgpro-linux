@@ -247,6 +247,27 @@ static int retry_first_command(uint8_t ep, uint8_t *buf, uint32_t len, int *tran
     return r;
 }
 
+/* The T76's FPGA streams payload ahead of the host. If a new READ_CODE is
+ * issued while data is still queued on the payload endpoint the endpoint
+ * stalls and every subsequent read times out (Xgpro then reports verify
+ * mismatches). Drain whatever is left before starting a new transaction. */
+static void drain_payload_ep(uint8_t ep)
+{
+    uint8_t buf[4096];
+    int total = 0;
+
+    if (!dev_handle) return;
+
+    for (int i = 0; i < 256; i++) {
+        int n = 0;
+        int r = libusb_bulk_transfer(dev_handle, ep, buf, sizeof(buf), &n, 20);
+        if (r != 0 || n <= 0) break;
+        total += n;
+    }
+    if (total > 0)
+        fprintf(stderr, "[bridge] drained %d stale bytes from ep 0x%02x\n", total, ep);
+}
+
 static int open_device(void) {
     if (dev_handle) return 0;
 
@@ -494,6 +515,9 @@ static void handle_client(int client_fd) {
                         fprintf(stderr, "%02x ", data_buf[i]);
                     fprintf(stderr, "\n");
                 }
+                if (req.pipe_id == 0x01 && req.length >= 1 && data_buf[0] == 0x0D)
+                    drain_payload_ep(0x82);
+
                 int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                              data_buf, req.length,
                                              &transferred, transfer_timeout(req.timeout_ms));
