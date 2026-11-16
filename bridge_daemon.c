@@ -401,6 +401,12 @@ static void handle_client(int client_fd) {
                 resp.length = 0;
             } else {
                 resp.length = transferred;
+                if (verbose) {
+                    fprintf(stderr, "[bridge] READ ep=0x%02x len=%d data=", req.pipe_id, transferred);
+                    for (int i = 0; i < transferred && i < 32; i++)
+                        fprintf(stderr, "%02x ", data_buf[i]);
+                    fprintf(stderr, "\n");
+                }
             }
             if (send_all(client_fd, &resp, sizeof(resp)) < 0) {
                 free(data_buf);
