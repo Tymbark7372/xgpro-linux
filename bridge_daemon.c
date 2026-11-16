@@ -152,16 +152,24 @@ static int open_device(void) {
         }
     }
 
-    int r = libusb_set_configuration(dev_handle, 1);
-    if (r < 0 && r != LIBUSB_ERROR_BUSY) {
-        fprintf(stderr, "[bridge] Failed to set configuration: %s\n", libusb_error_name(r));
-        libusb_close(dev_handle);
-        dev_handle = NULL;
-        kernel_driver_detached = 0;
-        return -1;
+    /* A redundant SET_CONFIGURATION wedges the CH569 in the T76: the next
+     * bulk transfer fails with LIBUSB_ERROR_IO and only a power cycle
+     * clears it. The device is already configured, so leave it alone. */
+    int cfg = 0;
+    if (libusb_get_configuration(dev_handle, &cfg) < 0 || cfg <= 0) {
+        int r = libusb_set_configuration(dev_handle, 1);
+        if (r < 0) {
+            fprintf(stderr, "[bridge] Failed to set configuration: %s\n", libusb_error_name(r));
+            libusb_close(dev_handle);
+            dev_handle = NULL;
+            kernel_driver_detached = 0;
+            return -1;
+        }
+    } else if (verbose) {
+        fprintf(stderr, "[bridge] Already configured (value %d), not re-setting\n", cfg);
     }
 
-    r = libusb_claim_interface(dev_handle, 0);
+    int r = libusb_claim_interface(dev_handle, 0);
     if (r < 0) {
         fprintf(stderr, "[bridge] Failed to claim interface: %s\n", libusb_error_name(r));
         libusb_close(dev_handle);
@@ -179,11 +187,12 @@ static int open_device(void) {
         bulk_ep_count = 4;
     }
 
-    libusb_set_interface_alt_setting(dev_handle, 0, 0);
-    libusb_clear_halt(dev_handle, 0x01);
-    libusb_clear_halt(dev_handle, 0x81);
-    libusb_clear_halt(dev_handle, 0x02);
-    libusb_clear_halt(dev_handle, 0x82);
+    /* No SET_INTERFACE / CLEAR_HALT here on purpose. The device is already
+     * on alt setting 0 with no halted endpoints, and issuing those requests
+     * to the CH569 in the T76 wedges it the same way a redundant
+     * SET_CONFIGURATION does: the next bulk transfer fails with
+     * LIBUSB_ERROR_IO and needs a power cycle. minipro never sends them
+     * either. Endpoints are only cleared after a transfer actually fails. */
 
     fprintf(stderr, "[bridge] %s opened, configured, and interface claimed\n", model_name);
     return 0;
