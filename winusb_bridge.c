@@ -35,6 +35,7 @@ typedef struct {
     uint8_t cmd;
     uint8_t pipe_id;
     uint32_t length;
+    uint32_t timeout_ms;   /* 0 = use the daemon default */
 } bridge_request_t;
 
 typedef struct {
@@ -76,6 +77,7 @@ static const xgpro_profile_t XGPRO_PROFILES[] = {
 #define XGPRO_PROFILE_COUNT ((int)(sizeof(XGPRO_PROFILES) / sizeof(XGPRO_PROFILES[0])))
 
 static int selected_profile = -1;
+static DWORD pipe_timeout_ms[256];   /* PIPE_TRANSFER_TIMEOUT per pipe */
 static char fake_dev_path[260];
 
 #define FAKE_HDEVINFO       ((HANDLE)(ULONG_PTR)0xDE000001)
@@ -528,7 +530,7 @@ __declspec(dllexport) BOOL __stdcall WinUsb_WritePipe(
         return FALSE;
     }
 
-    bridge_request_t req = { CMD_WRITE_PIPE, PipeID, BufferLength };
+    bridge_request_t req = { CMD_WRITE_PIPE, PipeID, BufferLength, pipe_timeout_ms[PipeID] };
     if (bridge_send(&req, sizeof(req)) < 0) {
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
@@ -567,7 +569,7 @@ __declspec(dllexport) BOOL __stdcall WinUsb_ReadPipe(
         return FALSE;
     }
 
-    bridge_request_t req = { CMD_READ_PIPE, PipeID, BufferLength };
+    bridge_request_t req = { CMD_READ_PIPE, PipeID, BufferLength, pipe_timeout_ms[PipeID] };
     if (bridge_send(&req, sizeof(req)) < 0) {
         LeaveCriticalSection(&bridge_cs);
         SetLastError(ERROR_GEN_FAILURE);
@@ -628,6 +630,14 @@ __declspec(dllexport) BOOL __stdcall WinUsb_SetPipePolicy(
 {
     if (is_verbose())
         dbg("WinUsb_SetPipePolicy pipe=0x%02x policy=%u", PipeID, PolicyType);
+
+    /* PIPE_TRANSFER_TIMEOUT: the app expects a transfer against a
+     * disappeared device to fail after this timeout, not hang. */
+    if (PolicyType == 3 && Value && ValueLength >= sizeof(DWORD)) {
+        pipe_timeout_ms[PipeID] = *(DWORD *)Value;
+        if (is_verbose())
+            dbg("  pipe 0x%02x timeout = %u ms", PipeID, pipe_timeout_ms[PipeID]);
+    }
 
     EnterCriticalSection(&bridge_cs);
     if (bridge_sock == INVALID_SOCKET) {

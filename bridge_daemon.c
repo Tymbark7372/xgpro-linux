@@ -127,6 +127,15 @@ static int generate_token(void) {
     return 0;
 }
 
+/* The shim forwards the app's PIPE_TRANSFER_TIMEOUT so a transfer against a
+ * device that just re-enumerated fails on the app's schedule instead of
+ * blocking for the daemon's default. */
+static int transfer_timeout(uint32_t requested) {
+    if (requested == 0) return 120000;
+    if (requested > 600000) return 600000;
+    return (int)requested;
+}
+
 static int open_device(void) {
     if (dev_handle) return 0;
 
@@ -330,7 +339,7 @@ static void handle_client(int client_fd) {
                 }
                 int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                              data_buf, req.length,
-                                             &transferred, 120000);
+                                             &transferred, transfer_timeout(req.timeout_ms));
                 if (r == 0 && transferred != (int)req.length) {
                     /* Never report a short write as success: a truncated
                      * chunk inside a firmware image or chip payload would
@@ -392,7 +401,7 @@ static void handle_client(int client_fd) {
             int transferred = 0;
             int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                          data_buf, req.length,
-                                         &transferred, 120000);
+                                         &transferred, transfer_timeout(req.timeout_ms));
             resp.status = (r == 0) ? 0 : r;
             if (r != 0) {
                 if (verbose)

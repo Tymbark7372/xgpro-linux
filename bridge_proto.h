@@ -20,6 +20,7 @@ typedef struct {
     uint8_t cmd;
     uint8_t pipe_id;
     uint32_t length;
+    uint32_t timeout_ms;   /* 0 = use the daemon default */
 } bridge_request_t;
 
 typedef struct {
