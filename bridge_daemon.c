@@ -166,6 +166,16 @@ static int discover_bulk_endpoints(void) {
     return 0;
 }
 
+/* After a firmware update the device switches into its bootloader, which
+ * resets and re-enumerates the USB device. The host side has to wait for it
+ * to come back instead of failing the first open. */
+#define OPEN_RETRY_TIMEOUT_MS  5000
+#define OPEN_RETRY_INTERVAL_MS 200
+/* After a reset the T76 needs time before it services commands. minipro
+ * waits 1000 ms here ("Wait for T76 to boot, otherwise minipro_open will
+ * fail"); without it the first command after re-enumeration goes unheard. */
+#define BOOT_SETTLE_MS         1000
+
 static int generate_token(void) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) {
@@ -228,16 +238,32 @@ static int retry_first_command(uint8_t ep, uint8_t *buf, uint32_t len, int *tran
 static int open_device(void) {
     if (dev_handle) return 0;
 
-    for (int i = 0; i < XGPRO_MODEL_COUNT && !dev_handle; i++) {
-        dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, XGPRO_MODELS[i].pid);
-        if (dev_handle) model_name = XGPRO_MODELS[i].name;
+    int waited = 0;
+
+    for (;;) {
+        for (int i = 0; i < XGPRO_MODEL_COUNT && !dev_handle; i++) {
+            dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, XGPRO_MODELS[i].pid);
+            if (dev_handle) model_name = XGPRO_MODELS[i].name;
+        }
+        if (dev_handle) break;
+
+        if (waited >= OPEN_RETRY_TIMEOUT_MS) {
+            fprintf(stderr, "[bridge] No XGecu programmer found (VID=%04x PIDs:", XGPRO_VID);
+            for (int i = 0; i < XGPRO_MODEL_COUNT; i++)
+                fprintf(stderr, " %04x", XGPRO_MODELS[i].pid);
+            fprintf(stderr, ")\n");
+            return -1;
+        }
+
+        fprintf(stderr, "[bridge] Device not present yet, waiting for re-enumeration (%d ms)\n", waited);
+        usleep(OPEN_RETRY_INTERVAL_MS * 1000);
+        waited += OPEN_RETRY_INTERVAL_MS;
     }
-    if (!dev_handle) {
-        fprintf(stderr, "[bridge] No XGecu programmer found (VID=%04x PIDs:", XGPRO_VID);
-        for (int i = 0; i < XGPRO_MODEL_COUNT; i++)
-            fprintf(stderr, " %04x", XGPRO_MODELS[i].pid);
-        fprintf(stderr, ")\n");
-        return -1;
+
+    if (waited > 0) {
+        fprintf(stderr, "[bridge] Device came back after %d ms, settling %d ms before use\n",
+                waited, BOOT_SETTLE_MS);
+        usleep(BOOT_SETTLE_MS * 1000);
     }
     fprintf(stderr, "[bridge] Found %s\n", model_name);
 
