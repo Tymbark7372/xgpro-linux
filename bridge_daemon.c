@@ -18,13 +18,25 @@ static int verbose = 0;
 #define MAX_TRANSFER_LEN (16 * 1024 * 1024)
 #define MAX_BULK_EPS 16
 
-/* Programmers are told apart by PID only; the VID is shared. */
+/* Programmers are told apart by PID only; the VID is shared.
+ *
+ * The families differ in more than identity, and the differences are not
+ * cosmetic: the T76 has one payload endpoint and a dead 0x83 that Xgpro still
+ * reads from, while the T48 family splits payloads across two endpoints that
+ * must be drained together or the firmware wedges. Keep that in one table
+ * instead of scattering PID checks. */
 static const struct xgpro_model {
-    uint16_t pid;
+    uint16_t    pid;
     const char *name;
+    uint8_t     payload_in;        /* payload read endpoint */
+    uint8_t     payload_in_peer;   /* second half, 0 when single-endpoint */
+    uint8_t     payload_out;       /* payload write endpoint */
+    uint8_t     payload_out_peer;  /* second half, 0 when single-endpoint */
+    uint8_t     unused_in_ep;      /* endpoint the firmware never services */
+    int         settle_ms;         /* wait after re-enumeration */
 } XGPRO_MODELS[] = {
-    { XGPRO_PID_T48, "T48/T56/TL866II Plus" },
-    { XGPRO_PID_T76, "T76" },
+    { XGPRO_PID_T48, "T48/T56/TL866II Plus", 0x82, 0x83, 0x02, 0x03, 0x00, 1000 },
+    { XGPRO_PID_T76, "T76",                  0x82, 0x00, 0x05, 0x00, 0x83, 1000 },
 };
 #define XGPRO_MODEL_COUNT ((int)(sizeof(XGPRO_MODELS) / sizeof(XGPRO_MODELS[0])))
 
@@ -40,7 +52,7 @@ static int send_all(int fd, const void *buf, size_t len);
 static uint8_t bulk_eps[MAX_BULK_EPS];
 static int bulk_ep_count = 0;
 static const char *model_name = NULL;
-static uint16_t model_pid = 0;   /* PID of the device actually opened */
+static const struct xgpro_model *model = NULL;   /* profile of the opened device */
 static int srv_fd = -1;
 static int active_client = -1;
 
@@ -127,11 +139,10 @@ static void sibling_cache_clear(void)
 
 static uint8_t payload_sibling(uint8_t ep)
 {
-    switch (ep) {
-    case 0x82: return 0x83;
-    case 0x83: return 0x82;
-    default:   return 0;
-    }
+    if (!model || !model->payload_in_peer) return 0;
+    if (ep == model->payload_in)      return model->payload_in_peer;
+    if (ep == model->payload_in_peer) return model->payload_in;
+    return 0;
 }
 
 typedef struct {
@@ -177,7 +188,7 @@ static int handle_paired_read(int client_fd, bridge_request_t *req,
     io_job_t a, b;
     int timeout;
 
-    if (model_pid != XGPRO_PID_T48 || other == 0 || req->length < PAIR_MIN_LEN)
+    if (!dev_handle || other == 0 || req->length < PAIR_MIN_LEN)
         return -1;
 
     /* Serve the sibling half we already fetched. */
@@ -342,7 +353,7 @@ static void warn_if_wedged(int r) {
 /* After a reset the T76 needs time before it services commands. minipro
  * waits 1000 ms here ("Wait for T76 to boot, otherwise minipro_open will
  * fail"); without it the first command after re-enumeration goes unheard. */
-#define BOOT_SETTLE_MS         1000
+#define BOOT_SETTLE_MS         1000   /* fallback when no profile is known */
 
 static int generate_token(void) {
     int fd = open("/dev/urandom", O_RDONLY);
@@ -433,8 +444,8 @@ static int open_device(void) {
         for (int i = 0; i < XGPRO_MODEL_COUNT && !dev_handle; i++) {
             dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, XGPRO_MODELS[i].pid);
             if (dev_handle) {
+                model = &XGPRO_MODELS[i];
                 model_name = XGPRO_MODELS[i].name;
-                model_pid = XGPRO_MODELS[i].pid;
             }
         }
         if (dev_handle) break;
@@ -455,7 +466,7 @@ static int open_device(void) {
     if (waited > 0) {
         fprintf(stderr, "[bridge] Device came back after %d ms, settling %d ms before use\n",
                 waited, BOOT_SETTLE_MS);
-        usleep(BOOT_SETTLE_MS * 1000);
+        usleep((model ? model->settle_ms : BOOT_SETTLE_MS) * 1000);
     }
     fprintf(stderr, "[bridge] Found %s\n", model_name);
 
@@ -726,9 +737,10 @@ static void handle_client(int client_fd) {
              * two blocks. Answer immediately with a zero-length success;
              * wine64 works around the same quirk by completing the overlapped
              * request early. */
-            if (model_pid == XGPRO_PID_T76 && req.pipe_id == 0x83) {
+            if (model && model->unused_in_ep && req.pipe_id == model->unused_in_ep) {
                 if (verbose)
-                    fprintf(stderr, "[bridge] T76: faking zero-length read on unused endpoint 0x83\n");
+                    fprintf(stderr, "[bridge] %s: faking zero-length read on unused endpoint 0x%02x\n",
+                            model->name, model->unused_in_ep);
                 resp.status = 0;
                 resp.length = 0;
                 if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
