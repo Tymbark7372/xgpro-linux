@@ -15,6 +15,7 @@
 static int verbose = 0;
 
 #define MAX_TRANSFER_LEN (16 * 1024 * 1024)
+#define MAX_BULK_EPS 16
 
 /* Programmers are told apart by PID only; the VID is shared. */
 static const struct xgpro_model {
@@ -31,6 +32,8 @@ static libusb_context *ctx = NULL;
 static volatile int running = 1;
 static int kernel_driver_detached = 0;
 static uint8_t auth_token[BRIDGE_TOKEN_LEN];
+static uint8_t bulk_eps[MAX_BULK_EPS];
+static int bulk_ep_count = 0;
 static const char *model_name = NULL;
 
 static void sig_handler(int sig) {
@@ -39,8 +42,58 @@ static void sig_handler(int sig) {
 }
 
 static int valid_pipe_id(uint8_t pipe_id) {
-    uint8_t ep = pipe_id & 0x7F;
-    return ep == 0x01 || ep == 0x02;
+    for (int i = 0; i < bulk_ep_count; i++) {
+        if (bulk_eps[i] == pipe_id) return 1;
+    }
+    return 0;
+}
+
+/* Endpoint addresses differ between programmer generations, so read them
+ * from the active configuration instead of assuming the TL866 layout. */
+static int discover_bulk_endpoints(void) {
+    struct libusb_config_descriptor *config = NULL;
+    const struct libusb_interface *iface;
+    const struct libusb_interface_descriptor *alt;
+
+    bulk_ep_count = 0;
+
+    if (libusb_get_active_config_descriptor(libusb_get_device(dev_handle), &config) < 0 ||
+        !config || config->bNumInterfaces < 1) {
+        fprintf(stderr, "[bridge] Warning: cannot read configuration descriptor\n");
+        return -1;
+    }
+
+    iface = &config->interface[0];
+    if (iface->num_altsetting < 1) {
+        libusb_free_config_descriptor(config);
+        return -1;
+    }
+    alt = &iface->altsetting[0];
+
+    for (int i = 0; i < alt->bNumEndpoints; i++) {
+        const struct libusb_endpoint_descriptor *ep = &alt->endpoint[i];
+
+        if ((ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) != LIBUSB_TRANSFER_TYPE_BULK)
+            continue;
+        if (bulk_ep_count >= MAX_BULK_EPS)
+            break;
+
+        bulk_eps[bulk_ep_count++] = ep->bEndpointAddress;
+        if (verbose) {
+            fprintf(stderr, "[bridge] Bulk endpoint 0x%02x (%s, max packet %u)\n",
+                    ep->bEndpointAddress,
+                    (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) ? "IN" : "OUT",
+                    ep->wMaxPacketSize);
+        }
+    }
+
+    libusb_free_config_descriptor(config);
+
+    if (bulk_ep_count == 0) {
+        fprintf(stderr, "[bridge] Warning: no bulk endpoints on interface 0\n");
+        return -1;
+    }
+    return 0;
 }
 
 static int generate_token(void) {
@@ -115,6 +168,15 @@ static int open_device(void) {
         dev_handle = NULL;
         kernel_driver_detached = 0;
         return -1;
+    }
+
+    if (discover_bulk_endpoints() < 0) {
+        fprintf(stderr, "[bridge] Falling back to TL866 endpoint layout\n");
+        bulk_eps[0] = 0x01;
+        bulk_eps[1] = 0x81;
+        bulk_eps[2] = 0x02;
+        bulk_eps[3] = 0x82;
+        bulk_ep_count = 4;
     }
 
     libusb_set_interface_alt_setting(dev_handle, 0, 0);
