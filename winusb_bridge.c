@@ -341,6 +341,39 @@ static HANDLE WINAPI my_CreateFileA(
     return orig_CreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSA, dwCreation, dwFlags, hTemplate);
 }
 
+typedef HANDLE (WINAPI *pfn_CreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+static pfn_CreateFileW orig_CreateFileW = NULL;
+
+/* Xgpro 13.16 and 13.25 open the programmer with CreateFileA and use
+ * CreateFileW only for ordinary files, so hooking the A variant is enough
+ * today. Hook W as well - filtered on the device path, everything else falls
+ * through - so an update that switches to the W variant cannot silently
+ * bypass the shim and report "no programmer". */
+static HANDLE WINAPI my_CreateFileW(
+    LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSA, DWORD dwCreation, DWORD dwFlags, HANDLE hTemplate)
+{
+    if (lpFileName) {
+        char ansi[1024];
+        int n = WideCharToMultiByte(CP_ACP, 0, lpFileName, -1, ansi, sizeof(ansi), NULL, NULL);
+
+        if (n > 0) {
+            _strupr(ansi);
+            if (strstr(ansi, "VID_A466")) {
+                dbg("CreateFileW: intercepted XGecu device open -> fake handle");
+                return FAKE_FILE_HANDLE;
+            }
+        }
+    }
+    if (!orig_CreateFileW)
+        orig_CreateFileW = (pfn_CreateFileW)GetProcAddress(GetModuleHandleA("kernel32.dll"), "CreateFileW");
+    if (!orig_CreateFileW) {
+        SetLastError(ERROR_INTERNAL_ERROR);
+        return INVALID_HANDLE_VALUE;
+    }
+    return orig_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSA, dwCreation, dwFlags, hTemplate);
+}
+
 
 static HINTERNET WINAPI my_InternetOpenA(
     LPCSTR lpszAgent, DWORD dwAccessType,
@@ -570,6 +603,8 @@ static void install_hooks(void) {
 
     patch_iat_entry(exe, "KERNEL32.dll", "CreateFileA",
                     my_CreateFileA, (void **)&orig_CreateFileA);
+    patch_iat_entry(exe, "KERNEL32.dll", "CreateFileW",
+                    my_CreateFileW, (void **)&orig_CreateFileW);
 
     patch_iat_entry(exe, "USER32.dll", "RegisterDeviceNotificationA",
                     my_RegisterDeviceNotificationA,
