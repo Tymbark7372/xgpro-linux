@@ -40,6 +40,7 @@ static int send_all(int fd, const void *buf, size_t len);
 static uint8_t bulk_eps[MAX_BULK_EPS];
 static int bulk_ep_count = 0;
 static const char *model_name = NULL;
+static uint16_t model_pid = 0;   /* PID of the device actually opened */
 static int srv_fd = -1;
 static int active_client = -1;
 
@@ -254,7 +255,10 @@ static int open_device(void) {
     for (;;) {
         for (int i = 0; i < XGPRO_MODEL_COUNT && !dev_handle; i++) {
             dev_handle = libusb_open_device_with_vid_pid(ctx, XGPRO_VID, XGPRO_MODELS[i].pid);
-            if (dev_handle) model_name = XGPRO_MODELS[i].name;
+            if (dev_handle) {
+                model_name = XGPRO_MODELS[i].name;
+                model_pid = XGPRO_MODELS[i].pid;
+            }
         }
         if (dev_handle) break;
 
@@ -529,6 +533,21 @@ static void handle_client(int client_fd) {
             if (!valid_pipe_id(req.pipe_id) || !(req.pipe_id & 0x80)) {
                 fprintf(stderr, "[bridge] CMD_READ_PIPE: rejecting invalid endpoint 0x%02x\n", req.pipe_id);
                 resp.status = -1;
+                if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
+                break;
+            }
+
+            /* The T76 firmware never services endpoint 0x83, yet Xgpro reads
+             * 32 bytes from it after the status query. Waiting for a reply
+             * burns the app's timeout and it then aborts the chip read after
+             * two blocks. Answer immediately with a zero-length success;
+             * wine64 works around the same quirk by completing the overlapped
+             * request early. */
+            if (model_pid == XGPRO_PID_T76 && req.pipe_id == 0x83) {
+                if (verbose)
+                    fprintf(stderr, "[bridge] T76: faking zero-length read on unused endpoint 0x83\n");
+                resp.status = 0;
+                resp.length = 0;
                 if (send_all(client_fd, &resp, sizeof(resp)) < 0) goto disconnect;
                 break;
             }
