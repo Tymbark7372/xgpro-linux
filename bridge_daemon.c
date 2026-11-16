@@ -55,6 +55,11 @@ static const char *model_name = NULL;
 static const struct xgpro_model *model = NULL;   /* profile of the opened device */
 static int srv_fd = -1;
 static int active_client = -1;
+static pthread_t event_thread;
+static int event_thread_started = 0;
+static pthread_mutex_t clients_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t clients_cv = PTHREAD_COND_INITIALIZER;
+static int clients_running = 0;
 
 
 static void handle_client(int client_fd);
@@ -262,6 +267,11 @@ static void *client_thread(void *arg)
     active_client = -1;
     close_device();
     close(fd);
+
+    pthread_mutex_lock(&clients_mu);
+    clients_running--;
+    pthread_cond_signal(&clients_cv);
+    pthread_mutex_unlock(&clients_mu);
     return NULL;
 }
 
@@ -870,9 +880,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[bridge] hotplug unavailable: %s (device notifications disabled)\n",
                 libusb_error_name(hp));
     } else {
-        pthread_t et;
-        if (pthread_create(&et, NULL, usb_event_thread, NULL) == 0)
-            pthread_detach(et);
+        if (pthread_create(&event_thread, NULL, usb_event_thread, NULL) == 0)
+            event_thread_started = 1;
         else
             fprintf(stderr, "[bridge] failed to start libusb event thread\n");
     }
@@ -918,18 +927,39 @@ int main(int argc, char **argv) {
         active_client = client_fd;
         {
             pthread_t t;
+            pthread_mutex_lock(&clients_mu);
+            clients_running++;
+            pthread_mutex_unlock(&clients_mu);
             if (pthread_create(&t, NULL, client_thread, (void *)(intptr_t)client_fd) == 0)
                 pthread_detach(t);
             else {
                 fprintf(stderr, "[bridge] failed to start client thread\n");
                 close(client_fd);
                 active_client = -1;
+                pthread_mutex_lock(&clients_mu);
+                clients_running--;
+                pthread_mutex_unlock(&clients_mu);
             }
         }
     }
 
     if (srv_fd >= 0) close(srv_fd);
+
+    /* Wait for client threads to finish their transfers: libusb_exit()
+     * asserts (and aborts) if any thread is still inside the context. */
+    pthread_mutex_lock(&clients_mu);
+    while (clients_running > 0)
+        pthread_cond_wait(&clients_cv, &clients_mu);
+    pthread_mutex_unlock(&clients_mu);
+
     close_device();
+
+    if (event_thread_started) {
+        running = 0;
+        pthread_join(event_thread, NULL);
+        event_thread_started = 0;
+    }
+
     unlink(BRIDGE_TOKEN_PATH);
     libusb_exit(ctx);
     fprintf(stderr, "[bridge] Shutdown\n");
