@@ -799,8 +799,13 @@ static void handle_client(int client_fd) {
                         fprintf(stderr, "%02x ", data_buf[i]);
                     fprintf(stderr, "\n");
                 }
-                if (req.pipe_id == 0x01 && req.length >= 1 && data_buf[0] == 0x0D)
-                    drain_payload_ep(0x82);
+                /* Only single-endpoint families can have stale payload: with
+                 * a paired family the halves belong to an in-flight transfer
+                 * and draining one would steal data. Use the profile instead
+                 * of a hardcoded 0x82. */
+                if (req.pipe_id == 0x01 && req.length >= 1 && data_buf[0] == 0x0D &&
+                    model && model->payload_in && model->payload_in_peer == 0)
+                    drain_payload_ep(model->payload_in);
 
                 int r = libusb_bulk_transfer(dev_handle, req.pipe_id,
                                              data_buf, req.length,
