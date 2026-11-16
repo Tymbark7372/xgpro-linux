@@ -166,6 +166,17 @@ static int discover_bulk_endpoints(void) {
     return 0;
 }
 
+/* A wedged XGecu programmer answers bulk transfers with LIBUSB_ERROR_IO and
+ * does not recover from a libusb_reset_device(); only a power cycle helps. */
+static int warned_wedged = 0;
+
+static void warn_if_wedged(int r) {
+    if (r != LIBUSB_ERROR_IO || warned_wedged) return;
+    warned_wedged = 1;
+    fprintf(stderr, "[bridge] Endpoint I/O error: the programmer may be wedged. "
+                    "A USB reset does not clear this; power-cycle it (unplug/replug).\n");
+}
+
 /* After a firmware update the device switches into its bootloader, which
  * resets and re-enumerates the USB device. The host side has to wait for it
  * to come back instead of failing the first open. */
@@ -502,6 +513,7 @@ static void handle_client(int client_fd) {
                     if (verbose)
                         fprintf(stderr, "[bridge] WRITE error: %s, transferred=%d\n", libusb_error_name(r), transferred);
                     reset_endpoint(req.pipe_id);
+                    warn_if_wedged(r);
                     handle_device_loss(r);
                 }
             }
@@ -556,6 +568,7 @@ static void handle_client(int client_fd) {
                 if (verbose)
                     fprintf(stderr, "[bridge] READ error: %s, transferred=%d\n", libusb_error_name(r), transferred);
                 reset_endpoint(req.pipe_id);
+                warn_if_wedged(r);
                 handle_device_loss(r);
                 resp.length = 0;
             } else {
