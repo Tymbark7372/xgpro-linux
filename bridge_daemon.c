@@ -183,6 +183,107 @@ static void io_pair(io_job_t *a, io_job_t *b)
     pthread_join(tb, NULL);
 }
 
+
+/* Writes use the same split as reads (minipro: "This is from XgPro"), so the
+ * two halves must go out together as well. The app is not guaranteed to have
+ * both halves ready when we see the first one, so hold it - answering
+ * immediately, because it may be waiting for that answer before sending the
+ * second - and transmit the pair when the sibling arrives. */
+static struct {
+    int      valid;
+    uint8_t  ep;
+    uint32_t len;
+    uint8_t *data;
+} pending_write;
+
+static void pending_write_clear(void)
+{
+    free(pending_write.data);
+    pending_write.data = NULL;
+    pending_write.valid = 0;
+    pending_write.ep = 0;
+    pending_write.len = 0;
+}
+
+/* Never let a held half be dropped silently: send it on its own and say so. */
+static void pending_write_flush(void)
+{
+    if (!pending_write.valid) return;
+
+    if (dev_handle && pending_write.len) {
+        int transferred = 0;
+        int r = libusb_bulk_transfer(dev_handle, pending_write.ep,
+                                     pending_write.data, pending_write.len,
+                                     &transferred, 5000);
+        fprintf(stderr, "[bridge] unpaired write flushed: ep=0x%02x len=%u %s (%d)\n",
+                pending_write.ep, pending_write.len, libusb_error_name(r), transferred);
+    }
+    pending_write_clear();
+}
+
+/* Returns 0 when handled (response already sent), -1 to use the generic path. */
+static int handle_paired_write(int client_fd, bridge_request_t *req,
+                               bridge_response_t *resp, uint8_t *buf)
+{
+    uint8_t other;
+    io_job_t a, b;
+    int timeout;
+
+    if (!dev_handle || !model || !model->payload_out_peer)
+        return -1;
+    if (req->length < PAIR_MIN_LEN)
+        return -1;
+    if (req->pipe_id != model->payload_out && req->pipe_id != model->payload_out_peer)
+        return -1;
+
+    other = (req->pipe_id == model->payload_out) ? model->payload_out_peer
+                                                 : model->payload_out;
+
+    /* The sibling of what we are holding? Send the pair together. */
+    if (pending_write.valid && pending_write.ep == other &&
+        pending_write.len == req->length) {
+        timeout = transfer_timeout(req->timeout_ms);
+
+        memset(&a, 0, sizeof(a));
+        a.ep = pending_write.ep; a.buf = pending_write.data;
+        a.len = pending_write.len; a.timeout = timeout;
+        memset(&b, 0, sizeof(b));
+        b.ep = req->pipe_id; b.buf = buf; b.len = req->length; b.timeout = timeout;
+
+        if (verbose)
+            fprintf(stderr, "[bridge] paired write: 0x%02x and 0x%02x, %u bytes each\n",
+                    a.ep, b.ep, a.len);
+        io_pair(&a, &b);
+        if (verbose)
+            fprintf(stderr, "[bridge] paired write: 0x%02x -> %s (%d), 0x%02x -> %s (%d)\n",
+                    a.ep, libusb_error_name(a.result), a.transferred,
+                    b.ep, libusb_error_name(b.result), b.transferred);
+        pending_write_clear();
+
+        resp->status = b.result;
+        resp->length = (b.result == 0) ? (uint32_t)b.transferred : 0;
+        if (a.result == 0 && b.result == 0) commands_since_open++;
+        free(buf);   /* the caller hands ownership over */
+        if (send_all(client_fd, resp, sizeof(*resp)) < 0) return 0;
+        return 0;
+    }
+
+    /* Otherwise hold this half and report success; the pair follows. */
+    pending_write_flush();
+    pending_write.data = buf;
+    pending_write.ep = req->pipe_id;
+    pending_write.len = req->length;
+    pending_write.valid = 1;
+    if (verbose)
+        fprintf(stderr, "[bridge] holding write half 0x%02x (%u bytes) for its pair\n",
+                req->pipe_id, req->length);
+
+    resp->status = 0;
+    resp->length = req->length;
+    if (send_all(client_fd, resp, sizeof(*resp)) < 0) return 0;
+    return 0;
+}
+
 /* Returns 0 when the request was handled (response already sent), -1 to fall
  * back to the generic path. */
 static int handle_paired_read(int client_fd, bridge_request_t *req,
@@ -682,6 +783,12 @@ static void handle_client(int client_fd) {
                     goto disconnect;
                 }
             }
+
+            if (handle_paired_write(client_fd, &req, &resp, data_buf) == 0) {
+                data_buf = NULL;   /* ownership moved into the helper */
+                break;
+            }
+
             if (!dev_handle) {
                 resp.status = -1;
             } else {
