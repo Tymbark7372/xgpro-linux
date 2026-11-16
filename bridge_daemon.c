@@ -35,10 +35,18 @@ static uint8_t auth_token[BRIDGE_TOKEN_LEN];
 static uint8_t bulk_eps[MAX_BULK_EPS];
 static int bulk_ep_count = 0;
 static const char *model_name = NULL;
+static int srv_fd = -1;
+static int active_client = -1;
 
 static void sig_handler(int sig) {
     (void)sig;
     running = 0;
+    /* Break out of accept()/recv_all() so the device handle is released
+     * before the process exits. A lingering daemon that still holds the
+     * usbfs node wedges the programmer for the next instance. */
+    if (srv_fd >= 0) close(srv_fd);
+    srv_fd = -1;
+    if (active_client >= 0) shutdown(active_client, SHUT_RDWR);
 }
 
 static int valid_pipe_id(uint8_t pipe_id) {
@@ -478,7 +486,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int srv_fd = socket(AF_INET, SOCK_STREAM, 0);
+    srv_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (srv_fd < 0) {
         perror("[bridge] socket");
         return 1;
@@ -516,11 +524,13 @@ int main(int argc, char **argv) {
         int bufsize = 256 * 1024;
         setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
+        active_client = client_fd;
         handle_client(client_fd);
+        active_client = -1;
         close_device();
     }
 
-    close(srv_fd);
+    if (srv_fd >= 0) close(srv_fd);
     close_device();
     unlink(BRIDGE_TOKEN_PATH);
     libusb_exit(ctx);
