@@ -9,6 +9,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <dbt.h>
 #include <wininet.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,7 +29,13 @@ enum bridge_cmd {
     CMD_SET_PIPE_POLICY,
     CMD_FLUSH_PIPE,
     CMD_ABORT_PIPE,
+    CMD_SUBSCRIBE,
 };
+
+typedef struct {
+    uint8_t  evt;    /* 1 = arrived, 0 = removed */
+    uint16_t pid;
+} bridge_event_t;
 
 #pragma pack(push, 1)
 typedef struct {
@@ -77,7 +84,11 @@ static const xgpro_profile_t XGPRO_PROFILES[] = {
 #define XGPRO_PROFILE_COUNT ((int)(sizeof(XGPRO_PROFILES) / sizeof(XGPRO_PROFILES[0])))
 
 static int selected_profile = -1;
+static volatile LONG sub_started = 0;
 static DWORD pipe_timeout_ms[256];   /* PIPE_TRANSFER_TIMEOUT per pipe */
+static HWND  notify_hwnd = NULL;            /* window the app registered for WM_DEVICECHANGE */
+static GUID  notify_guid;                   /* interface GUID the app registered with */
+static BOOL  notify_guid_valid = FALSE;
 static char fake_dev_path[260];
 
 #define FAKE_HDEVINFO       ((HANDLE)(ULONG_PTR)0xDE000001)
@@ -430,6 +441,119 @@ static void patch_iat_entry(HMODULE module, const char *target_dll,
     }
 }
 
+typedef HDEVNOTIFY (WINAPI *pfn_RegDevNotifA)(HANDLE, LPVOID, DWORD);
+static pfn_RegDevNotifA orig_RegisterDeviceNotificationA = NULL;
+static DWORD WINAPI subscriber_thread(LPVOID unused);
+
+/* Xgpro registers for device-interface notifications and then waits for a
+ * DBT_DEVICEREMOVECOMPLETE/DBT_DEVICEARRIVAL pair as the "USB port reset ack"
+ * after asking the programmer to reset its port (command 0x3F). Nothing
+ * arrives under Wine, so remember the window and replay the pair ourselves. */
+static HDEVNOTIFY WINAPI my_RegisterDeviceNotificationA(
+    HANDLE hRecipient, LPVOID NotificationFilter, DWORD Flags)
+{
+    if (NotificationFilter) {
+        const BYTE *p = (const BYTE *)NotificationFilter;
+        if (*(DWORD *)(p + 4) == DBT_DEVTYP_DEVICEINTERFACE) {
+            memcpy(&notify_guid, p + 12, sizeof(GUID));
+            notify_guid_valid = TRUE;
+        }
+    }
+    notify_hwnd = (HWND)hRecipient;
+    dbg("RegisterDeviceNotificationA: hwnd=%p guid_valid=%d",
+        (void *)notify_hwnd, notify_guid_valid);
+
+    if (InterlockedExchange(&sub_started, 1) == 0) {
+        CloseHandle(CreateThread(NULL, 0, subscriber_thread, NULL, 0, NULL));
+        dbg("started hotplug subscriber");
+    }
+    return (HDEVNOTIFY)(ULONG_PTR)0xDB000001;
+}
+
+static int sub_recv_all(SOCKET s, void *buf, int len)
+{
+    char *p = (char *)buf;
+    while (len > 0) {
+        int n = recv(s, p, len, 0);
+        if (n <= 0) return -1;
+        p += n;
+        len -= n;
+    }
+    return 0;
+}
+
+/* Subscribe to the daemon's libusb hotplug feed and replay the real
+ * attach/detach events to the window the app registered. Nothing is
+ * synthesised: the app only hears about what the hardware actually did. */
+static DWORD WINAPI subscriber_thread(LPVOID unused)
+{
+    WSADATA wsa;
+    SOCKET s;
+    struct sockaddr_in a;
+    uint8_t token[BRIDGE_TOKEN_LEN];
+    DWORD got = 0;
+    HANDLE h;
+    bridge_request_t req;
+
+    (void)unused;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
+
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+
+    ZeroMemory(&a, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(BRIDGE_PORT);
+    a.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(s, (struct sockaddr *)&a, sizeof(a)) != 0) { closesocket(s); return 0; }
+
+    h = CreateFileA(BRIDGE_TOKEN_PATH_WINE, GENERIC_READ, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) { closesocket(s); return 0; }
+    if (!ReadFile(h, token, BRIDGE_TOKEN_LEN, &got, NULL) || got != BRIDGE_TOKEN_LEN) {
+        CloseHandle(h);
+        closesocket(s);
+        return 0;
+    }
+    CloseHandle(h);
+    if (send(s, (const char *)token, BRIDGE_TOKEN_LEN, 0) != BRIDGE_TOKEN_LEN) {
+        closesocket(s);
+        return 0;
+    }
+
+    ZeroMemory(&req, sizeof(req));
+    req.cmd = CMD_SUBSCRIBE;
+    if (send(s, (const char *)&req, sizeof(req), 0) != sizeof(req)) {
+        closesocket(s);
+        return 0;
+    }
+    dbg("hotplug subscriber connected");
+
+    for (;;) {
+        bridge_event_t ev;
+        DEV_BROADCAST_DEVICEINTERFACE_W bi;
+
+        if (sub_recv_all(s, &ev, sizeof(ev)) < 0) break;
+
+        ZeroMemory(&bi, sizeof(bi));
+        bi.dbcc_size = sizeof(bi);
+        bi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+        if (notify_guid_valid) bi.dbcc_classguid = notify_guid;
+
+        dbg("hardware event: %s pid=%04x", ev.evt ? "arrived" : "removed", ev.pid);
+        if (notify_hwnd) {
+            SendMessageW(notify_hwnd, WM_DEVICECHANGE,
+                         ev.evt ? DBT_DEVICEARRIVAL : DBT_DEVICEREMOVECOMPLETE,
+                         (LPARAM)&bi);
+            RedrawWindow(notify_hwnd, NULL, NULL, RDW_INVALIDATE);
+        }
+    }
+
+    dbg("hotplug subscriber disconnected");
+    closesocket(s);
+    return 0;
+}
+
 static void install_hooks(void) {
     HMODULE exe = GetModuleHandleA(NULL);
 
@@ -446,6 +570,10 @@ static void install_hooks(void) {
 
     patch_iat_entry(exe, "KERNEL32.dll", "CreateFileA",
                     my_CreateFileA, (void **)&orig_CreateFileA);
+
+    patch_iat_entry(exe, "USER32.dll", "RegisterDeviceNotificationA",
+                    my_RegisterDeviceNotificationA,
+                    (void **)&orig_RegisterDeviceNotificationA);
 
     patch_iat_entry(exe, "WININET.dll", "InternetOpenA",
                     my_InternetOpenA, NULL);

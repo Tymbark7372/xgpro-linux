@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <libusb-1.0/libusb.h>
+#include <pthread.h>
 #include "bridge_proto.h"
 
 static int verbose = 0;
@@ -33,6 +34,9 @@ static volatile int running = 1;
 static int kernel_driver_detached = 0;
 static uint8_t auth_token[BRIDGE_TOKEN_LEN];
 static int commands_since_open = 0;   /* >0 once the handle has done real work */
+static int event_fd = -1;                 /* subscribed client for hotplug events */
+static pthread_mutex_t event_mu = PTHREAD_MUTEX_INITIALIZER;
+static int send_all(int fd, const void *buf, size_t len);
 static uint8_t bulk_eps[MAX_BULK_EPS];
 static int bulk_ep_count = 0;
 static const char *model_name = NULL;
@@ -41,6 +45,58 @@ static int active_client = -1;
 
 
 static void handle_client(int client_fd);
+static void close_device(void);
+static int open_device(void);
+
+/* Real hotplug, no fabrication: the app is told about attach/detach exactly
+ * when the programmer does it. This is what the firmware-update flow needs,
+ * because the T76 re-enumerates (and even changes bus) at the bootloader
+ * switch. */
+static int LIBUSB_CALL hotplug_cb(libusb_context *ctx, libusb_device *dev,
+                                  libusb_hotplug_event event, void *user_data)
+{
+    struct libusb_device_descriptor dd;
+    bridge_event_t ev;
+    (void)ctx;
+    (void)user_data;
+
+    if (libusb_get_device_descriptor(dev, &dd) < 0) return 0;
+    ev.evt = (event == LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED) ? 1 : 0;
+    ev.pid = dd.idProduct;
+
+    fprintf(stderr, "[bridge] hotplug: %s pid=%04x\n",
+            ev.evt ? "arrived" : "removed", ev.pid);
+
+    pthread_mutex_lock(&event_mu);
+    if (event_fd >= 0) {
+        if (send_all(event_fd, &ev, sizeof(ev)) < 0) {
+            close(event_fd);
+            event_fd = -1;
+        }
+    }
+    pthread_mutex_unlock(&event_mu);
+    return 0;
+}
+
+static void *usb_event_thread(void *arg)
+{
+    struct timeval tv = {0, 100000};
+    (void)arg;
+    while (running)
+        libusb_handle_events_timeout_completed(ctx, &tv, NULL);
+    return NULL;
+}
+
+static void *client_thread(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    handle_client(fd);
+    active_client = -1;
+    close_device();
+    close(fd);
+    return NULL;
+}
+
 static void close_device(void);
 static int open_device(void);
 
@@ -320,6 +376,23 @@ static void handle_client(int client_fd) {
         bridge_response_t resp = {0, 0};
         uint8_t *data_buf = NULL;
 
+        if (req.cmd == CMD_SUBSCRIBE) {
+            pthread_mutex_lock(&event_mu);
+            event_fd = client_fd;
+            pthread_mutex_unlock(&event_mu);
+            fprintf(stderr, "[bridge] hotplug subscriber attached\n");
+            /* Hold the connection open; events are pushed from the callback. */
+            {
+                char sink[64];
+                while (read(client_fd, sink, sizeof(sink)) > 0) { }
+            }
+            pthread_mutex_lock(&event_mu);
+            if (event_fd == client_fd) event_fd = -1;
+            pthread_mutex_unlock(&event_mu);
+            fprintf(stderr, "[bridge] hotplug subscriber gone\n");
+            return;
+        }
+
         switch (req.cmd) {
         case CMD_OPEN:
             resp.status = open_device();
@@ -529,6 +602,22 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    libusb_hotplug_callback_handle hp_handle;
+    int hp = libusb_hotplug_register_callback(ctx,
+        LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED | LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT,
+        LIBUSB_HOTPLUG_NO_FLAGS, XGPRO_VID, LIBUSB_HOTPLUG_MATCH_ANY,
+        LIBUSB_HOTPLUG_MATCH_ANY, hotplug_cb, NULL, &hp_handle);
+    if (hp != LIBUSB_SUCCESS) {
+        fprintf(stderr, "[bridge] hotplug unavailable: %s (device notifications disabled)\n",
+                libusb_error_name(hp));
+    } else {
+        pthread_t et;
+        if (pthread_create(&et, NULL, usb_event_thread, NULL) == 0)
+            pthread_detach(et);
+        else
+            fprintf(stderr, "[bridge] failed to start libusb event thread\n");
+    }
+
     srv_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (srv_fd < 0) {
         perror("[bridge] socket");
@@ -568,9 +657,16 @@ int main(int argc, char **argv) {
         setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize));
         active_client = client_fd;
-        handle_client(client_fd);
-        active_client = -1;
-        close_device();
+        {
+            pthread_t t;
+            if (pthread_create(&t, NULL, client_thread, (void *)(intptr_t)client_fd) == 0)
+                pthread_detach(t);
+            else {
+                fprintf(stderr, "[bridge] failed to start client thread\n");
+                close(client_fd);
+                active_client = -1;
+            }
+        }
     }
 
     if (srv_fd >= 0) close(srv_fd);

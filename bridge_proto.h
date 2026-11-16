@@ -13,7 +13,14 @@ enum bridge_cmd {
     CMD_SET_PIPE_POLICY,
     CMD_FLUSH_PIPE,
     CMD_ABORT_PIPE,
+    CMD_SUBSCRIBE,
 };
+
+/* Pushed to a subscriber when the programmer genuinely attaches/detaches. */
+typedef struct {
+    uint8_t  evt;    /* 1 = arrived, 0 = removed */
+    uint16_t pid;
+} bridge_event_t;
 
 #pragma pack(push, 1)
 typedef struct {
